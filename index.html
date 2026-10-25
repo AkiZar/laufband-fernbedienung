@@ -67,8 +67,8 @@
     <option value="stop">2. Stopp-Befehl suchen (Band muss laufen)</option>
     <option value="speed">3. Tempo-Befehl suchen (Band muss laufen, ~1 km/h)</option>
     <option value="binary">4. Binäre Protokolle anderer Hersteller (19 Tests)</option>
-    <option value="header">5. Andere Kopfkennungen statt EE (~170 Tests)</option>
-    <option value="sweep">6. Prüfsumme 0–399 für Eingabe unter „Manuell“ (Standard st20)</option>
+    <option value="header">5. Andere Kopfkennungen statt EE (~120 Tests)</option>
+    <option value="sweep">6. Alle 256 Prüfsummen für Eingabe unter „Manuell“ (Standard st20)</option>
   </select>
   <label style="margin-top:8px">Ab Nr. <input id="probeFrom" type="number" min="1" value="1" style="width:90px;font:15px ui-monospace,Menlo,monospace;padding:8px;border-radius:8px;border:1px solid var(--line);background:#14181d;color:var(--text)"></label>
   <div id="probeInfo">Bereit.</div>
@@ -104,7 +104,6 @@
 <script>
 const uuid16 = n => `0000${n}-0000-1000-8000-00805f9b34fb`;
 const SVC = uuid16('ffe0'), CH1 = uuid16('ffe1'), CH2 = uuid16('ffe2');
-const CS_OFFSET = 184; // Prüfsumme = Summe aller Ziffern + 184 (aus den Statusmeldungen ermittelt)
 const $ = id => document.getElementById(id);
 const enc = new TextEncoder(), dec = new TextDecoder();
 
@@ -113,7 +112,7 @@ let rxBuf = '';
 let last = null;          // zuletzt empfangener Status (Objekt)
 let lastRaw = '';
 let extraMsgs = [];
-let lastCsKey = '';
+let lastGood = null; // letzte fehlerfreie Meldung (Vorlage für volle Statuszeilen)
 const hist = [];  // letzte Statusmeldungen, um verstümmelte Einzelmeldungen auszufiltern       // Meldungen, die nicht ins Statusformat passen
 
 // ---------- Protokoll ----------
@@ -133,7 +132,17 @@ function log(msg) {
 
 // ---------- Format ----------
 function digitSum(s) { let n = 0; for (const c of s) if (c >= '0' && c <= '9') n += +c; return n; }
-function frame(payload) { return `EE,${payload},${digitSum(payload) + CS_OFFSET},FF`; }
+// Echte Prüfsumme (an allen Meldungen geprüft, auch über 10 Minuten Laufzeit):
+// ASCII-Werte aller Ziffern addieren (Ziffern im s-Feld zählen wie '0'), minus 101, modulo 256, dreistellig.
+function csReal(fields) {
+  let t = 0;
+  for (const f of fields) {
+    const key = (f.match(/^[a-z]+/i) || [''])[0];
+    for (const ch of f) if (ch >= '0' && ch <= '9') t += key === 's' ? 48 : ch.charCodeAt(0);
+  }
+  return String((((t - 101) % 256) + 256) % 256).padStart(3, '0');
+}
+function frame(payload) { return `EE,${payload},${csReal(payload.split(','))},FF`; }
 function parseStatus(txt) {
   const parts = txt.split(',');
   if (parts[0] !== 'EE' || parts[parts.length - 1] !== 'FF') return null;
@@ -185,12 +194,9 @@ function handleStatus(raw, which) {
   const changed = !prev || keys.some(k => prev[k] !== s[k]);
   if (changed) log(`<< ${which}: ${raw}`);
   const body = raw.split(',').slice(1, -2);
-  const csA = digitSum(body.join(',')) + CS_OFFSET;
-  const csB = digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187;
-  const csKey = `${+s._cs === csA}/${+s._cs === csB}`;
   const shapeOk = /^EE,c\d+,sf\d+,st\d+,mp\d+\.\d,ms\d+,mi\d+\.\d,ca\d+,dis\d+\.\d\d,h\d+,s\d+,p\d+\.\d,t\d+\.\d\d,\d+,FF$/.test(raw);
-  if ((+s._cs !== csA && +s._cs !== csB) || !shapeOk) log(`!! fehlerhafte Meldung: ${raw}`);
-  if (csKey !== lastCsKey) { log(`-- Prüfsumme: ${s._cs}, Formel A (alle Ziffern+184)=${csA}, Formel B (ohne s-Feld +187)=${csB}`); lastCsKey = csKey; }
+  if (s._cs === csReal(body) && shapeOk) lastGood = s;
+  else log(`!! fehlerhafte Meldung (Prüfsumme erwartet ${csReal(body)}): ${raw}`);
   lastRaw = raw;
   const stName = { '10': 'steht', '20': 'läuft', '30': 'startet' }[s.st] || ('st' + s.st);
   $('vSt').textContent = stName;
@@ -265,18 +271,13 @@ async function sendText(txt) { await sendBytes(enc.encode(txt), JSON.stringify(t
 // ---------- Kandidaten ----------
 // Volle Statuszeile mit geänderten Feldern zurückschicken (manche Platinen erwarten genau das)
 function fullFrame(changes) {
-  const s = Object.assign({}, last || {}, changes);
+  const s = Object.assign({}, lastGood || last || {}, changes);
   const order = ['c', 'sf', 'st', 'mp', 'ms', 'mi', 'ca', 'dis', 'h', 's', 'p', 't'];
   const payload = order.map(k => k + (s[k] ?? '0')).join(',');
   return frame(payload);
 }
 // gleiche Zeile, aber Prüfsumme nach Formel B (Ziffern ohne s-Feld + 187)
-function fullFrameB(changes) {
-  const a = fullFrame(changes).split(',');
-  const body = a.slice(1, -2);
-  a[a.length - 2] = String(digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187);
-  return a.join(',');
-}
+function fullFrameB(changes) { return fullFrame(changes); }
 
 function variants(payload) {
   return [
@@ -285,7 +286,6 @@ function variants(payload) {
     payload,                             // roh
     payload + '\r\n',                    // roh mit Zeilenende
     `EE,${payload},${digitSum(payload)},FF`, // Prüfsumme ohne Offset
-    `EE,${payload},${digitSum(payload) + 187},FF`, // Offset 187
   ];
 }
 
@@ -309,15 +309,14 @@ function candidates(mode) {
   } else if (mode === 'header') {
     // Andere Kopf-/Endkennungen als EE…FF (die App könnte z. B. mit AA… senden)
     for (const x of ['st20', 'st30', 'c1', 'p1.0']) {
-      const ds = digitSum(x);
       for (const H of ['AA', 'BB', 'CC', 'DD', 'FF', 'SS', 'ST', 'EF', 'FE', 'EA', 'AE', 'ES', 'CE'])
-        add([`${H},${x},FF`, `${H},${x},${ds + 184},FF`, `${H},${x},${ds + 17},FF`]);
-      add([`EE,${x},${ds + 17},FF`, `EE,${x},EE`, `EE,${x},FF\r\n`, `EE${x}FF`, `EE,${x},${ds + 184},FF\r\n`]);
+        add([`${H},${x},FF`, `${H},${x},${csReal([x])},FF`]);
+      add([`EE,${x},EE`, `EE,${x},FF\r\n`, `EE${x}FF`, `EE,${x},${csReal([x])},FF\r\n`]);
     }
   } else if (mode === 'sweep') {
     // Prüfsumme durchprobieren: EE,<Eingabe>,0…399,FF
     const x = $('manual').value.trim() || 'st20';
-    for (let n = 0; n < 400; n++) list.push(`EE,${x},${n},FF`);
+    for (let n = 0; n < 256; n++) list.push(`EE,${x},${String(n).padStart(3, '0')},FF`);
   }
   return list;
 }
@@ -405,7 +404,7 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 6 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 7 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
