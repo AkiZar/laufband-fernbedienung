@@ -70,6 +70,7 @@
     <option value="header">5. Andere Kopfkennungen statt EE (~170 Tests)</option>
     <option value="sweep">6. Prüfsumme 0–399 für Eingabe unter „Manuell“ (Standard st20)</option>
   </select>
+  <label style="margin-top:8px">Ab Nr. <input id="probeFrom" type="number" min="1" value="1" style="width:90px;font:15px ui-monospace,Menlo,monospace;padding:8px;border-radius:8px;border:1px solid var(--line);background:#14181d;color:var(--text)"></label>
   <div id="probeInfo">Bereit.</div>
   <div class="row">
     <button id="btnProbe" class="primary" disabled>Test starten</button>
@@ -112,7 +113,8 @@ let rxBuf = '';
 let last = null;          // zuletzt empfangener Status (Objekt)
 let lastRaw = '';
 let extraMsgs = [];
-let lastCsKey = '';       // Meldungen, die nicht ins Statusformat passen
+let lastCsKey = '';
+const hist = [];  // letzte Statusmeldungen, um verstümmelte Einzelmeldungen auszufiltern       // Meldungen, die nicht ins Statusformat passen
 
 // ---------- Protokoll ----------
 function errStr(e) {
@@ -177,6 +179,7 @@ function handleStatus(raw, which) {
   if (!s) { log(`<< ? ${raw}`); extraMsgs.push(raw); return; }
   const prev = last;
   last = s;
+  hist.push(s); if (hist.length > 5) hist.shift();
   // Nur Änderungen loggen, die nicht ohnehin laufend passieren (Zeit/Strecke/Kalorien/Prüfsumme)
   const keys = Object.keys(s).filter(k => !['t', 'dis', 'ca', '_cs'].includes(k));
   const changed = !prev || keys.some(k => prev[k] !== s[k]);
@@ -185,7 +188,8 @@ function handleStatus(raw, which) {
   const csA = digitSum(body.join(',')) + CS_OFFSET;
   const csB = digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187;
   const csKey = `${+s._cs === csA}/${+s._cs === csB}`;
-  if (+s._cs !== csA && +s._cs !== csB) log(`!! fehlerhafte Meldung: ${raw}`);
+  const shapeOk = /^EE,c\d+,sf\d+,st\d+,mp\d+\.\d,ms\d+,mi\d+\.\d,ca\d+,dis\d+\.\d\d,h\d+,s\d+,p\d+\.\d,t\d+\.\d\d,\d+,FF$/.test(raw);
+  if ((+s._cs !== csA && +s._cs !== csB) || !shapeOk) log(`!! fehlerhafte Meldung: ${raw}`);
   if (csKey !== lastCsKey) { log(`-- Prüfsumme: ${s._cs}, Formel A (alle Ziffern+184)=${csA}, Formel B (ohne s-Feld +187)=${csB}`); lastCsKey = csKey; }
   lastRaw = raw;
   const stName = { '10': 'steht', '20': 'läuft', '30': 'startet' }[s.st] || ('st' + s.st);
@@ -347,12 +351,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function reacted(before, extrasBefore) {
   if (extraMsgs.length > extrasBefore) return 'neue Antwort vom Band';
-  if (!last || !before) return null;
-  if (last.st !== before.st) return `Zustand ${before.st} → ${last.st}`;
-  const dp = parseFloat(last.p) - parseFloat(before.p);
-  if (probe.wasStopped && parseFloat(last.p) > 0) return `Tempo ${before.p} → ${last.p}`;
-  if (!probe.wasStopped && Math.abs(dp) >= 0.3) return `Tempo ${before.p} → ${last.p}`;
-  for (const k of ['c', 'sf', 'mp', 'ms', 'mi', 'h', 's']) if (last[k] !== before[k]) return `Feld ${k}: ${before[k]} → ${last[k]}`;
+  if (!last || !before || hist.length < 2) return null;
+  // Nur Änderungen zählen, die in den letzten zwei Meldungen gleich sind –
+  // einzelne verstümmelte Meldungen (fehlende Zeichen) lösen sonst Fehlalarme aus.
+  const a = hist[hist.length - 1], b = hist[hist.length - 2];
+  const val = k => (a[k] === b[k] ? a[k] : before[k]);
+  if (val('st') !== before.st) return `Zustand ${before.st} → ${val('st')}`;
+  const p = parseFloat(val('p')), dp = p - parseFloat(before.p);
+  if (probe.wasStopped && p > 0) return `Tempo ${before.p} → ${val('p')}`;
+  if (!probe.wasStopped && Math.abs(dp) >= 0.3) return `Tempo ${before.p} → ${val('p')}`;
+  for (const k of ['c', 'sf', 'mp', 'ms', 'mi', 'h', 's']) if (val(k) !== before[k]) return `Feld ${k}: ${before[k]} → ${val(k)}`;
   return null;
 }
 
@@ -362,7 +370,9 @@ async function runProbe() {
   if (!last) { alert('Noch kein Status empfangen. Kurz warten.'); return; }
   if (mode === 'start' && last.st !== '10') { alert('Für den Start-Test muss das Band stehen.'); return; }
   if ((mode === 'stop' || mode === 'speed') && last.st === '10') { alert('Für diesen Test muss das Band laufen (per Fernbedienung starten).'); return; }
-  if (probe.mode !== mode || probe.i >= probe.list.length) { probe.mode = mode; probe.list = candidates(mode); probe.i = 0; }
+  if (probe.mode !== mode || probe.i >= probe.list.length || !probe.list.length) { probe.mode = mode; probe.list = candidates(mode); probe.i = 0; }
+  const from = parseInt($('probeFrom').value, 10);
+  if (from > 1 && probe.i === 0) probe.i = Math.min(from - 1, probe.list.length - 1);
   probe.wasStopped = last.st === '10';
   probe.running = true;
   log(`== Test "${mode}" ab Nr. ${probe.i + 1} von ${probe.list.length} (Band ${probe.wasStopped ? 'steht' : 'läuft'})`);
@@ -377,6 +387,7 @@ async function runProbe() {
     let why = null;
     for (let w = 0; w < waitMs / 300 && !why; w++) { await sleep(300); why = reacted(before, extras); }
     probe.i++;
+    $('probeFrom').value = probe.i + 1;
     if (why) {
       probe.running = false;
       log(`** TREFFER bei Nr. ${probe.i}: ${label} → ${why}`);
@@ -394,13 +405,13 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 5.1 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 6 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
 $('btnProbe').onclick = runProbe;
 $('btnProbePause').onclick = () => { probe.running = false; $('probeInfo').textContent += '  (pausiert)'; log('== pausiert'); };
-$('probeMode').onchange = () => { probe.running = false; probe.i = 0; probe.list = []; $('probeInfo').textContent = 'Bereit.'; };
+$('probeMode').onchange = () => { probe.running = false; probe.i = 0; probe.list = []; $('probeFrom').value = 1; $('probeInfo').textContent = 'Bereit.'; };
 $('btnSend').onclick = async () => {
   const v = $('manual').value.trim();
   if (!v) return;
