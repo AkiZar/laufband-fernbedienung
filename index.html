@@ -172,7 +172,7 @@ function onData(which, ev) {
   let m;
   while ((m = rxBufs[which].match(/EE,[^]*?,FF/))) {
     const before = rxBufs[which].slice(0, m.index).trim();
-    if (before) { log(`<< ${which} (anderes) "${before}"`); extraMsgs.push(before); }
+    if (before) noteOther(which, before);
     rxBufs[which] = rxBufs[which].slice(m.index + m[0].length);
     // gleiche Meldung kurz hintereinander (doppelt zugestellt) nur einmal verarbeiten
     const now = Date.now();
@@ -180,7 +180,15 @@ function onData(which, ev) {
     lastRawSeen = m[0]; lastRawAt = now;
     handleStatus(m[0], which);
   }
-  if (rxBufs[which].length > 300) { log(`<< ${which} (anderes) "${rxBufs[which]}"`); extraMsgs.push(rxBufs[which]); rxBufs[which] = ''; }
+  if (rxBufs[which].length > 300) { noteOther(which, rxBufs[which]); rxBufs[which] = ''; }
+  // Rest, der wie das Ende einer Statuszeile aussieht, aber kein EE hat (erstes Zeichen verloren): verwerfen
+  if (/,FF\s*$/.test(rxBufs[which]) || (rxBufs[which] && !/^\s*E/.test(rxBufs[which]))) { noteOther(which, rxBufs[which]); rxBufs[which] = ''; }
+}
+
+function noteOther(which, txt) {
+  if (/sf\d|dis\d|mp\d|,FF/.test(txt)) { log(`!! verstümmelte Statuszeile (${which}): "${txt}"`); return; }
+  log(`<< ${which} (anderes) "${txt}"`);
+  extraMsgs.push(txt);
 }
 
 function handleStatus(raw, which) {
@@ -369,6 +377,8 @@ async function runProbe() {
   if (!last) { alert('Noch kein Status empfangen. Kurz warten.'); return; }
   if (mode === 'start' && last.st !== '10') { alert('Für den Start-Test muss das Band stehen.'); return; }
   if ((mode === 'stop' || mode === 'speed') && last.st === '10') { alert('Für diesen Test muss das Band laufen (per Fernbedienung starten).'); return; }
+  const sweepPayload = $('manual').value.trim() || 'st20';
+  if (mode === 'sweep' && /^st[23]/.test(sweepPayload) && last.st !== '10') { alert(`Für "${sweepPayload}" muss das Band stehen – sonst sieht man keine Wirkung.`); return; }
   if (probe.mode !== mode || probe.i >= probe.list.length || !probe.list.length) { probe.mode = mode; probe.list = candidates(mode); probe.i = 0; }
   const from = parseInt($('probeFrom').value, 10);
   if (from > 1 && probe.i === 0) probe.i = Math.min(from - 1, probe.list.length - 1);
@@ -404,7 +414,7 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 7 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 8 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
