@@ -98,7 +98,8 @@
 </div>
 
 <script>
-const SVC = 0xffe0, CH1 = 0xffe1, CH2 = 0xffe2;
+const uuid16 = n => `0000${n}-0000-1000-8000-00805f9b34fb`;
+const SVC = uuid16('ffe0'), CH1 = uuid16('ffe1'), CH2 = uuid16('ffe2');
 const CS_OFFSET = 184; // Prüfsumme = Summe aller Ziffern + 184 (aus den Statusmeldungen ermittelt)
 const $ = id => document.getElementById(id);
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -110,6 +111,13 @@ let lastRaw = '';
 let extraMsgs = [];       // Meldungen, die nicht ins Statusformat passen
 
 // ---------- Protokoll ----------
+function errStr(e) {
+  if (e == null) return String(e);
+  if (typeof e === 'string') return e;
+  const parts = [e.name, e.message, e.code].filter(x => x !== undefined && x !== '');
+  if (parts.length) return parts.join(' / ');
+  try { return JSON.stringify(e) + ' ' + String(e); } catch { return String(e); }
+}
 function ts() { return new Date().toTimeString().slice(0, 8); }
 function log(msg) {
   const el = $('log');
@@ -179,7 +187,7 @@ async function connect(showAll) {
     if (!navigator.bluetooth) { alert('Kein Web Bluetooth. Bitte die Seite in der App "Bluefy" öffnen.'); return; }
     $('status').textContent = 'Geräteauswahl geöffnet …';
     device = await navigator.bluetooth.requestDevice(showAll
-      ? { acceptAllDevices: true, optionalServices: [SVC, '0000ffe0-0000-1000-8000-00805f9b34fb'] }
+      ? { acceptAllDevices: true, optionalServices: [SVC] }
       : { filters: [{ namePrefix: 'MAXFREE' }, { services: [SVC] }], optionalServices: [SVC] });
     device.addEventListener('gattserverdisconnected', () => {
       $('status').textContent = 'Verbindung getrennt';
@@ -187,23 +195,27 @@ async function connect(showAll) {
       setUi(false);
       probe.running = false;
     });
+    log('-- gewählt: ' + (device.name || device.id));
     $('status').textContent = 'Verbinde …';
     const server = await device.gatt.connect();
+    log('-- GATT verbunden');
     const svc = await server.getPrimaryService(SVC);
+    log('-- Service FFE0 gefunden');
     ch1 = await svc.getCharacteristic(CH1);
     await ch1.startNotifications();
+    log('-- FFE1 abonniert');
     ch1.addEventListener('characteristicvaluechanged', e => onData('FFE1', e));
     try {
       ch2 = await svc.getCharacteristic(CH2);
       await ch2.startNotifications();
       ch2.addEventListener('characteristicvaluechanged', e => onData('FFE2', e));
-    } catch (e) { log('FFE2 nicht abonniert: ' + e.message); }
+    } catch (e) { log('FFE2 nicht abonniert: ' + errStr(e)); }
     $('status').textContent = 'Verbunden mit ' + (device.name || 'Laufband');
     log('-- verbunden: ' + device.name);
     setUi(true);
   } catch (e) {
-    $('status').textContent = 'Fehler: ' + e.message;
-    log('!! ' + e.message);
+    $('status').textContent = 'Fehler: ' + errStr(e);
+    log('!! Verbinden: ' + errStr(e));
   }
 }
 function setUi(on) {
@@ -220,7 +232,7 @@ async function sendBytes(bytes, label) {
     if (ch1.writeValueWithResponse) await ch1.writeValueWithResponse(bytes);
     else await ch1.writeValue(bytes);
   } catch (e) {
-    log('!! Schreiben fehlgeschlagen: ' + e.message);
+    log('!! Schreiben fehlgeschlagen: ' + errStr(e));
   }
 }
 async function sendText(txt) { await sendBytes(enc.encode(txt), JSON.stringify(txt)); }
@@ -311,9 +323,9 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 2 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 3 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
-window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + (e.reason?.message || e.reason)));
+window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
 $('btnProbe').onclick = runProbe;
 $('btnProbePause').onclick = () => { probe.running = false; $('probeInfo').textContent += '  (pausiert)'; log('== pausiert'); };
