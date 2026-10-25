@@ -66,6 +66,9 @@
     <option value="start">1. Start-Befehl suchen (Band muss stehen)</option>
     <option value="stop">2. Stopp-Befehl suchen (Band muss laufen)</option>
     <option value="speed">3. Tempo-Befehl suchen (Band muss laufen, ~1 km/h)</option>
+    <option value="binary">4. Binäre Protokolle anderer Hersteller (19 Tests)</option>
+    <option value="header">5. Andere Kopfkennungen statt EE (~170 Tests)</option>
+    <option value="sweep">6. Prüfsumme 0–399 für Eingabe unter „Manuell“ (Standard st20)</option>
   </select>
   <div id="probeInfo">Bereit.</div>
   <div class="row">
@@ -292,12 +295,50 @@ function candidates(mode) {
     for (const c of [{ st: '10' }, { st: '10', p: '0.0' }]) add([fullFrame(c), fullFrameB(c)]);
     for (const p of ['st10', 'st0', 'stop', 'STOP', 'Stop', 'off', 'c0', 'k0', 'key0', 'b0', 'cmd0',
                      'p0.0', 'sp0.0', 'v0.0', 'pause', 'st40']) add(variants(p));
-  } else {
+  } else if (mode === 'speed') {
     for (const c of [{ p: '2.0' }, { st: '20', p: '2.0' }]) add([fullFrame(c), fullFrameB(c)]);
     for (const p of ['p2.0', 'sp2.0', 'v2.0', 'spd2.0', 'speed2.0', 'p20', 'sp20', 'v20', 'up', 'UP', '+', 'k2', 'key2', 'b2']) add(variants(p));
+  } else if (mode === 'binary') {
+    // Binäre Protokolle anderer Laufband-Steuerungen (FitShow, KingSmith, FTMS-Control-Point)
+    for (const [hex, note] of BINARY) list.push({ hex, note });
+  } else if (mode === 'header') {
+    // Andere Kopf-/Endkennungen als EE…FF (die App könnte z. B. mit AA… senden)
+    for (const x of ['st20', 'st30', 'c1', 'p1.0']) {
+      const ds = digitSum(x);
+      for (const H of ['AA', 'BB', 'CC', 'DD', 'FF', 'SS', 'ST', 'EF', 'FE', 'EA', 'AE', 'ES', 'CE'])
+        add([`${H},${x},FF`, `${H},${x},${ds + 184},FF`, `${H},${x},${ds + 17},FF`]);
+      add([`EE,${x},${ds + 17},FF`, `EE,${x},EE`, `EE,${x},FF\r\n`, `EE${x}FF`, `EE,${x},${ds + 184},FF\r\n`]);
+    }
+  } else if (mode === 'sweep') {
+    // Prüfsumme durchprobieren: EE,<Eingabe>,0…399,FF
+    const x = $('manual').value.trim() || 'st20';
+    for (let n = 0; n < 400; n++) list.push(`EE,${x},${n},FF`);
   }
   return list;
 }
+
+const BINARY = [
+  ['02 51 51 03', 'FitShow Status-Abfrage'],
+  ['02 50 00 50 03', 'FitShow Geräteinfo'],
+  ['02 53 01 52 03', 'FitShow Start'],
+  ['02 53 02 0A 00 5B 03', 'FitShow Tempo 1.0'],
+  ['02 53 02 14 00 45 03', 'FitShow Tempo 2.0'],
+  ['02 53 03 50 03', 'FitShow Stopp'],
+  ['F7 A2 02 01 A5 FD', 'KingSmith Modus manuell'],
+  ['F7 A2 04 01 A7 FD', 'KingSmith Start'],
+  ['F7 A2 01 14 B7 FD', 'KingSmith Tempo 2.0'],
+  ['F7 A2 01 00 A3 FD', 'KingSmith Stopp'],
+  ['00', 'FTMS Kontrolle anfordern'],
+  ['07', 'FTMS Start'],
+  ['02 C8 00', 'FTMS Tempo 2.0'],
+  ['08 01', 'FTMS Stopp'],
+  ['AA 01 01 55', 'generisch AA Start'],
+  ['55 AA 01 01', 'generisch 55AA Start'],
+  ['A5 01 A4', 'generisch A5 Start'],
+  ['01', 'Byte 01'],
+  ['02', 'Byte 02'],
+];
+const WAIT_MS = { sweep: 1200 };
 
 // ---------- Automatischer Test ----------
 const probe = { running: false, list: [], i: 0, mode: 'start' };
@@ -308,8 +349,8 @@ function reacted(before, extrasBefore) {
   if (!last || !before) return null;
   if (last.st !== before.st) return `Zustand ${before.st} → ${last.st}`;
   const dp = parseFloat(last.p) - parseFloat(before.p);
-  if (probe.mode === 'start' && parseFloat(last.p) > 0) return `Tempo ${before.p} → ${last.p}`;
-  if (probe.mode !== 'start' && Math.abs(dp) >= 0.3) return `Tempo ${before.p} → ${last.p}`;
+  if (probe.wasStopped && parseFloat(last.p) > 0) return `Tempo ${before.p} → ${last.p}`;
+  if (!probe.wasStopped && Math.abs(dp) >= 0.3) return `Tempo ${before.p} → ${last.p}`;
   for (const k of ['c', 'sf', 'mp', 'ms', 'mi', 'h', 's']) if (last[k] !== before[k]) return `Feld ${k}: ${before[k]} → ${last[k]}`;
   return null;
 }
@@ -319,22 +360,26 @@ async function runProbe() {
   const mode = $('probeMode').value;
   if (!last) { alert('Noch kein Status empfangen. Kurz warten.'); return; }
   if (mode === 'start' && last.st !== '10') { alert('Für den Start-Test muss das Band stehen.'); return; }
-  if (mode !== 'start' && last.st === '10') { alert('Für diesen Test muss das Band laufen (per Fernbedienung starten).'); return; }
+  if ((mode === 'stop' || mode === 'speed') && last.st === '10') { alert('Für diesen Test muss das Band laufen (per Fernbedienung starten).'); return; }
   if (probe.mode !== mode || probe.i >= probe.list.length) { probe.mode = mode; probe.list = candidates(mode); probe.i = 0; }
+  probe.wasStopped = last.st === '10';
   probe.running = true;
-  log(`== Test "${mode}" ab Nr. ${probe.i + 1} von ${probe.list.length}`);
+  log(`== Test "${mode}" ab Nr. ${probe.i + 1} von ${probe.list.length} (Band ${probe.wasStopped ? 'steht' : 'läuft'})`);
+  const waitMs = WAIT_MS[mode] || 3000;
   while (probe.running && probe.i < probe.list.length) {
     const cmd = probe.list[probe.i];
-    $('probeInfo').textContent = `Nr. ${probe.i + 1}/${probe.list.length}: ${JSON.stringify(cmd)}`;
+    const label = typeof cmd === 'string' ? JSON.stringify(cmd) : `[hex] ${cmd.hex} (${cmd.note})`;
+    $('probeInfo').textContent = `Nr. ${probe.i + 1}/${probe.list.length}: ${label}`;
     const before = Object.assign({}, last), extras = extraMsgs.length;
-    await sendText(cmd);
+    if (typeof cmd === 'string') await sendText(cmd);
+    else await sendBytes(new Uint8Array(cmd.hex.split(' ').map(h => parseInt(h, 16))), label);
     let why = null;
-    for (let w = 0; w < 6 && !why; w++) { await sleep(500); why = reacted(before, extras); }
+    for (let w = 0; w < waitMs / 300 && !why; w++) { await sleep(300); why = reacted(before, extras); }
     probe.i++;
     if (why) {
       probe.running = false;
-      log(`** TREFFER bei Nr. ${probe.i}: ${JSON.stringify(cmd)} → ${why}`);
-      $('probeInfo').innerHTML = `<span class="hit">Treffer!</span> Nr. ${probe.i}: ${JSON.stringify(cmd).replace(/</g, '&lt;')}<br>${why}`;
+      log(`** TREFFER bei Nr. ${probe.i}: ${label} → ${why}`);
+      $('probeInfo').innerHTML = `<span class="hit">Treffer!</span> Nr. ${probe.i}: ${label.replace(/</g, '&lt;')}<br>${why}`;
       return;
     }
   }
@@ -348,7 +393,7 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 4 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 5 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
