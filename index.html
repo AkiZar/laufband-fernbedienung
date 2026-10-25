@@ -185,6 +185,7 @@ function handleStatus(raw, which) {
   const csA = digitSum(body.join(',')) + CS_OFFSET;
   const csB = digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187;
   const csKey = `${+s._cs === csA}/${+s._cs === csB}`;
+  if (+s._cs !== csA && +s._cs !== csB) log(`!! fehlerhafte Meldung: ${raw}`);
   if (csKey !== lastCsKey) { log(`-- Prüfsumme: ${s._cs}, Formel A (alle Ziffern+184)=${csA}, Formel B (ohne s-Feld +187)=${csB}`); lastCsKey = csKey; }
   lastRaw = raw;
   const stName = { '10': 'steht', '20': 'läuft', '30': 'startet' }[s.st] || ('st' + s.st);
@@ -393,7 +394,7 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 5 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 5.1 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
