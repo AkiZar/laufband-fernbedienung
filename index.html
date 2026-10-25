@@ -108,7 +108,8 @@ let device, ch1, ch2;
 let rxBuf = '';
 let last = null;          // zuletzt empfangener Status (Objekt)
 let lastRaw = '';
-let extraMsgs = [];       // Meldungen, die nicht ins Statusformat passen
+let extraMsgs = [];
+let lastCsKey = '';       // Meldungen, die nicht ins Statusformat passen
 
 // ---------- Protokoll ----------
 function errStr(e) {
@@ -141,26 +142,34 @@ function parseStatus(txt) {
 function hexOf(bytes) { return [...bytes].map(b => b.toString(16).padStart(2, '0')).join(' '); }
 
 // ---------- Empfang ----------
+// Statusmeldungen können auf FFE1 oder FFE2 ankommen (Bluefy meldet sie auf FFE2) – beide gleich behandeln.
+const rxBufs = { FFE1: '', FFE2: '' };
+let lastRawSeen = '', lastRawAt = 0;
 function onData(which, ev) {
-  const bytes = new Uint8Array(ev.target.value.buffer);
+  const dv = ev.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset || 0, dv.byteLength);
   const txt = dec.decode(bytes);
-  if (which === 'FFE2' || !/^[\x20-\x7e\r\n]*$/.test(txt)) {
-    log(`<< ${which} [hex] ${hexOf(bytes)}  "${txt.replace(/[^\x20-\x7e]/g, '.')}"`);
+  if (!/^[\x20-\x7e\r\n]*$/.test(txt)) {
+    log(`<< ${which} [hex] ${hexOf(bytes)}`);
     extraMsgs.push(txt);
     return;
   }
-  rxBuf += txt;
+  rxBufs[which] += txt;
   let m;
-  while ((m = rxBuf.match(/EE,[^]*?,FF/))) {
-    const before = rxBuf.slice(0, m.index).trim();
-    if (before) { log(`<< FFE1 (anderes) "${before}"`); extraMsgs.push(before); }
-    handleStatus(m[0]);
-    rxBuf = rxBuf.slice(m.index + m[0].length);
+  while ((m = rxBufs[which].match(/EE,[^]*?,FF/))) {
+    const before = rxBufs[which].slice(0, m.index).trim();
+    if (before) { log(`<< ${which} (anderes) "${before}"`); extraMsgs.push(before); }
+    rxBufs[which] = rxBufs[which].slice(m.index + m[0].length);
+    // gleiche Meldung kurz hintereinander (doppelt zugestellt) nur einmal verarbeiten
+    const now = Date.now();
+    if (m[0] === lastRawSeen && now - lastRawAt < 700) continue;
+    lastRawSeen = m[0]; lastRawAt = now;
+    handleStatus(m[0], which);
   }
-  if (rxBuf.length > 300) { log(`<< FFE1 (anderes) "${rxBuf}"`); extraMsgs.push(rxBuf); rxBuf = ''; }
+  if (rxBufs[which].length > 300) { log(`<< ${which} (anderes) "${rxBufs[which]}"`); extraMsgs.push(rxBufs[which]); rxBufs[which] = ''; }
 }
 
-function handleStatus(raw) {
+function handleStatus(raw, which) {
   const s = parseStatus(raw);
   if (!s) { log(`<< ? ${raw}`); extraMsgs.push(raw); return; }
   const prev = last;
@@ -168,9 +177,12 @@ function handleStatus(raw) {
   // Nur Änderungen loggen, die nicht ohnehin laufend passieren (Zeit/Strecke/Kalorien/Prüfsumme)
   const keys = Object.keys(s).filter(k => !['t', 'dis', 'ca', '_cs'].includes(k));
   const changed = !prev || keys.some(k => prev[k] !== s[k]);
-  if (changed) log(`<< ${raw}`);
-  const ok = digitSum(raw.split(',').slice(1, -2).join(',')) + CS_OFFSET === +s._cs;
-  if (!ok) log(`!! Prüfsumme passt nicht: ${raw}`);
+  if (changed) log(`<< ${which}: ${raw}`);
+  const body = raw.split(',').slice(1, -2);
+  const csA = digitSum(body.join(',')) + CS_OFFSET;
+  const csB = digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187;
+  const csKey = `${+s._cs === csA}/${+s._cs === csB}`;
+  if (csKey !== lastCsKey) { log(`-- Prüfsumme: ${s._cs}, Formel A (alle Ziffern+184)=${csA}, Formel B (ohne s-Feld +187)=${csB}`); lastCsKey = csKey; }
   lastRaw = raw;
   const stName = { '10': 'steht', '20': 'läuft', '30': 'startet' }[s.st] || ('st' + s.st);
   $('vSt').textContent = stName;
@@ -182,6 +194,7 @@ function handleStatus(raw) {
 }
 
 // ---------- Verbindung ----------
+const h1 = e => onData('FFE1', e), h2 = e => onData('FFE2', e);
 async function connect(showAll) {
   try {
     if (!navigator.bluetooth) { alert('Kein Web Bluetooth. Bitte die Seite in der App "Bluefy" öffnen.'); return; }
@@ -202,13 +215,17 @@ async function connect(showAll) {
     const svc = await server.getPrimaryService(SVC);
     log('-- Service FFE0 gefunden');
     ch1 = await svc.getCharacteristic(CH1);
+    ch1.oncharacteristicvaluechanged = null;
+    ch1.removeEventListener('characteristicvaluechanged', h1);
+    ch1.addEventListener('characteristicvaluechanged', h1);
     await ch1.startNotifications();
     log('-- FFE1 abonniert');
-    ch1.addEventListener('characteristicvaluechanged', e => onData('FFE1', e));
     try {
       ch2 = await svc.getCharacteristic(CH2);
+      ch2.removeEventListener('characteristicvaluechanged', h2);
+      ch2.addEventListener('characteristicvaluechanged', h2);
       await ch2.startNotifications();
-      ch2.addEventListener('characteristicvaluechanged', e => onData('FFE2', e));
+      log('-- FFE2 abonniert');
     } catch (e) { log('FFE2 nicht abonniert: ' + errStr(e)); }
     $('status').textContent = 'Verbunden mit ' + (device.name || 'Laufband');
     log('-- verbunden: ' + device.name);
@@ -245,6 +262,13 @@ function fullFrame(changes) {
   const payload = order.map(k => k + (s[k] ?? '0')).join(',');
   return frame(payload);
 }
+// gleiche Zeile, aber Prüfsumme nach Formel B (Ziffern ohne s-Feld + 187)
+function fullFrameB(changes) {
+  const a = fullFrame(changes).split(',');
+  const body = a.slice(1, -2);
+  a[a.length - 2] = String(digitSum(body.filter(f => !/^s\d/.test(f)).join(',')) + 187);
+  return a.join(',');
+}
 
 function variants(payload) {
   return [
@@ -253,6 +277,7 @@ function variants(payload) {
     payload,                             // roh
     payload + '\r\n',                    // roh mit Zeilenende
     `EE,${payload},${digitSum(payload)},FF`, // Prüfsumme ohne Offset
+    `EE,${payload},${digitSum(payload) + 187},FF`, // Offset 187
   ];
 }
 
@@ -260,15 +285,15 @@ function candidates(mode) {
   const list = [];
   const add = arr => arr.forEach(x => { if (!list.includes(x)) list.push(x); });
   if (mode === 'start') {
-    add([fullFrame({ st: '30' }), fullFrame({ st: '20' }), fullFrame({ st: '30', p: '1.0' }), fullFrame({ st: '20', p: '1.0' })]);
+    for (const c of [{ st: '30' }, { st: '20' }, { st: '30', p: '1.0' }, { st: '20', p: '1.0' }]) add([fullFrame(c), fullFrameB(c)]);
     for (const p of ['st30', 'st20', 'st1', 'st2', 'st3', 'start', 'START', 'Start', 'run', 'go', 'on',
                      'c1', 'sf1', 'k1', 'key1', 'b1', 'cmd1', 's1', 'p1.0', 'sp1.0', 'v1.0', 'spd1.0']) add(variants(p));
   } else if (mode === 'stop') {
-    add([fullFrame({ st: '10' }), fullFrame({ st: '10', p: '0.0' })]);
+    for (const c of [{ st: '10' }, { st: '10', p: '0.0' }]) add([fullFrame(c), fullFrameB(c)]);
     for (const p of ['st10', 'st0', 'stop', 'STOP', 'Stop', 'off', 'c0', 'k0', 'key0', 'b0', 'cmd0',
                      'p0.0', 'sp0.0', 'v0.0', 'pause', 'st40']) add(variants(p));
   } else {
-    add([fullFrame({ p: '2.0' }), fullFrame({ st: '20', p: '2.0' })]);
+    for (const c of [{ p: '2.0' }, { st: '20', p: '2.0' }]) add([fullFrame(c), fullFrameB(c)]);
     for (const p of ['p2.0', 'sp2.0', 'v2.0', 'spd2.0', 'speed2.0', 'p20', 'sp20', 'v20', 'up', 'UP', '+', 'k2', 'key2', 'b2']) add(variants(p));
   }
   return list;
@@ -323,7 +348,7 @@ async function runProbe() {
 // ---------- UI ----------
 $('btnConnect').onclick = () => connect(false);
 $('btnConnectAll').onclick = () => connect(true);
-$('env').textContent = `Version 3 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+$('env').textContent = `Version 4 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
 window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
 window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + errStr(e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
