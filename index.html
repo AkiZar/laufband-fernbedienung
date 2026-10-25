@@ -41,7 +41,11 @@
     <button id="btnConnect" class="primary">Verbinden</button>
     <button id="btnDisconnect" disabled>Trennen</button>
   </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnConnectAll">Verbinden (alle Geräte zeigen)</button>
+  </div>
   <div id="status">Nicht verbunden</div>
+  <div id="env" class="hint"></div>
 </div>
 
 <div class="card">
@@ -170,13 +174,13 @@ function handleStatus(raw) {
 }
 
 // ---------- Verbindung ----------
-async function connect() {
+async function connect(showAll) {
   try {
     if (!navigator.bluetooth) { alert('Kein Web Bluetooth. Bitte die Seite in der App "Bluefy" öffnen.'); return; }
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'MAXFREE' }, { services: [SVC] }],
-      optionalServices: [SVC]
-    });
+    $('status').textContent = 'Geräteauswahl geöffnet …';
+    device = await navigator.bluetooth.requestDevice(showAll
+      ? { acceptAllDevices: true, optionalServices: [SVC, '0000ffe0-0000-1000-8000-00805f9b34fb'] }
+      : { filters: [{ namePrefix: 'MAXFREE' }, { services: [SVC] }], optionalServices: [SVC] });
     device.addEventListener('gattserverdisconnected', () => {
       $('status').textContent = 'Verbindung getrennt';
       log('-- Verbindung getrennt');
@@ -305,7 +309,11 @@ async function runProbe() {
 }
 
 // ---------- UI ----------
-$('btnConnect').onclick = connect;
+$('btnConnect').onclick = () => connect(false);
+$('btnConnectAll').onclick = () => connect(true);
+$('env').textContent = `Version 2 · Web Bluetooth: ${navigator.bluetooth ? 'verfügbar' : 'NICHT verfügbar'}`;
+window.addEventListener('error', e => log('!! JS-Fehler: ' + e.message));
+window.addEventListener('unhandledrejection', e => log('!! Fehler: ' + (e.reason?.message || e.reason)));
 $('btnDisconnect').onclick = () => { probe.running = false; device?.gatt?.disconnect(); };
 $('btnProbe').onclick = runProbe;
 $('btnProbePause').onclick = () => { probe.running = false; $('probeInfo').textContent += '  (pausiert)'; log('== pausiert'); };
